@@ -227,21 +227,20 @@
     analyze.type = 'button';
     analyze.className = 'ai-tag-add';
     analyze.textContent = '分析目前資料';
-    analyze.title = '把目前 ASM Daily 表格資料整理後丟給 AI';
+    analyze.title = '請 AI 根據目前頁面即時資料做重點分析';
     analyze.addEventListener('click', () => {
-      try {
-        const snapshot = window.getAsmDailySnapshot ? window.getAsmDailySnapshot() : null;
-        if (!snapshot) {
-          alert('目前沒有可分析的資料（請先等 Excel 讀取完成）。');
-          return;
-        }
-        const prompt = buildAnalysisPrompt(snapshot);
-        if (input) input.value = prompt;
-        open();
-        if (input) input.focus();
-      } catch (e) {
-        alert('產生分析資料失敗: ' + e.message);
+      // Page data is now auto-attached on every send, so this only needs to
+      // ask the question; no need to dump the whole table into the input box.
+      const snapshot = window.getAsmDailySnapshot ? window.getAsmDailySnapshot() : null;
+      if (!snapshot) {
+        alert('目前沒有可分析的資料（請先等 Excel 讀取完成）。');
+        return;
       }
+      if (input) {
+        input.value = '請根據目前頁面的 ASM Daily 即時資料,條列需要優先關注的 chamber/EQPID 與原因(請引用具體欄位與數值),並針對每個異常給建議 action。';
+      }
+      open();
+      if (input) input.focus();
     });
     tagsRow.appendChild(analyze);
   }
@@ -495,7 +494,7 @@
       const res = await fetch(PROXY_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json; charset=utf-8' },
-        body: JSON.stringify({ messages: s.history })
+        body: JSON.stringify({ messages: buildOutboundMessages(s) })
       });
       const data = await res.json();
       typing.remove();
@@ -534,6 +533,90 @@
   // Expose helpers for bridge
   window.__aiChatOpen = open;
   window.__aiChatSetInputAndOpen = (text) => { if (input) input.value = text || ''; open(); };
+
+  // ===================================================================
+  //  Auto-context: every outbound request carries (1) ASM TOOL domain
+  //  knowledge and (2) a fresh snapshot of the page's live data, so the
+  //  AI can answer questions about the dashboard without the user having
+  //  to paste anything. Built fresh on each send and NOT stored in the
+  //  saved history (keeps sessions small, always reflects latest data).
+  // ===================================================================
+
+  // Static domain knowledge derived from the dashboard's own logic
+  // (column meanings + the exact alert thresholds used in ASM Daily.js).
+  function buildAsmKnowledge() {
+    return [
+      '【ASM TOOL 知識庫】(回答時請依此解讀欄位與門檻)',
+      '本頁是 ASM 機台(chamber)每日監控儀表板。EQPID 形如 HKG-A01B,末碼 A/B/C/D 對應 chamber 1/2/3/4。',
+      '欄位語意與警示門檻:',
+      '- Cycle: coating 累積 cycle 數;顯示為「cycle (cycle - UD_PM)」。',
+      '- PM: 上次 PM 日期 (MM/DD)。',
+      '- Coat: S5 coating 剩餘量;< 3.1 視為偏低(紅字),需留意換 coating。',
+      '- State: 機台狀態。SB=standby、PD=production(生產中)、UD=unscheduled down(非預期停機)、UD_M/UD_MO=維修中、SD=scheduled down、SD_M、NS_OFF=關機、EG=工程。',
+      '- HPC+/M22/R22/Ehv/ULP: 該 chamber 對各製程的資格旗標,有資格為「V」。HPC+/M22/R22 合計為「HPC+/M22/R22 Chamber」數;Ehv/ULP 合計為「eHV/ULP Chamber」數。',
+      '- M22 Inhib / HPC Inhib: inhibit 狀態(灰底代表 inhibit=2)。',
+      '- S6_Min: S6 最近一筆量測;> 141 偏高(藍字)。',
+      '- W/C: 晶圓計數 (wafer count);> 5000 偏高(藍字),接近需保養。',
+      '- Oxide: 最新 oxide 厚度值。目標約 9.55。9.48–9.70=偏低(金)、≥9.70=高(綠)、>10.20=過高(藍)。',
+      '- S7 Remain: S7 vessel 剩餘百分比;< 15% 嚴重不足(橘底紅字);< 30% 且距上次秤重 > 60 天(粉紅底)需補。',
+      '- S7 Temp: S7 溫度;> 175.9 偏高(紅字)。',
+      '- UD_PM: 預估/實際 PM 對應 cycle。階差: Base 分頁結果;> 0.9 需注意。',
+      '- Delta: oxide 最新與前一筆差值;> 0.2 上升(藍)、< -0.2 下降(紅);|Δ| > 0.42 變動過大(有底色)。',
+      '- Last PA: 最近 3 筆 PA mean;單值 > 5 偏高(紅字)。CH 欄可點開 PA 趨勢圖,EQPID 可點開 OXIDE 趨勢圖。',
+      '- 製程欄淺綠/淺黃底色: 代表該 chamber 目前條件(State 為 PD/SB、Oxide 落在該製程區間、無 V、Delta 在 ±0.419 內)建議可做該 coating。',
+      '判讀原則: 優先關注 State 異常(UD/UD_M)、Coat<3.1、S7 Remain 偏低、Oxide 超標、Delta 過大、W/C 偏高者;回答請引用具體 EQPID 與數值。'
+    ].join('\n');
+  }
+
+  // Compact live snapshot of the page (summary + tile states + full table).
+  // PA/OXIDE time-series are omitted here to keep每則請求精簡; ask the user to
+  // open the chart for deep trend analysis when needed.
+  function buildLiveDataContext(snapshot) {
+    if (!snapshot) return '【目前頁面資料】(尚無資料,Excel 可能還沒讀取完成)';
+    const lines = ['【目前頁面即時資料】'];
+
+    const sm = snapshot.summary || {};
+    if (sm.today) lines.push(sm.today);
+    if (sm.hmrSummary) lines.push(sm.hmrSummary);
+    if (sm.euSummary) lines.push(sm.euSummary);
+    if (sm.fileInfo) lines.push(sm.fileInfo);
+
+    const tiles = snapshot.tiles || [];
+    if (tiles.length) {
+      lines.push('');
+      lines.push('Tile 狀態 (eqpid=state): ' +
+        tiles.map(t => `${t.eqpid}=${t.class || 'NONE'}`).join(', '));
+    }
+
+    const rows = snapshot.rows || [];
+    lines.push('');
+    lines.push('表格 (' + rows.length + ' 台):');
+    if (rows.length) {
+      const cols = Object.keys(rows[0]);
+      lines.push('欄位: ' + cols.join(' | '));
+      rows.forEach(r => {
+        lines.push(cols.map(k => {
+          const v = r ? r[k] : '';
+          return (v == null) ? '' : String(v).trim().replace(/\s+/g, ' ');
+        }).join(' | '));
+      });
+    }
+    return lines.join('\n');
+  }
+
+  // Build the messages array actually sent to the proxy: a fresh context
+  // system message (knowledge + live data) followed by the chat history.
+  function buildOutboundMessages(s) {
+    let context = buildAsmKnowledge();
+    try {
+      const snap = window.getAsmDailySnapshot ? window.getAsmDailySnapshot() : null;
+      context += '\n\n' + buildLiveDataContext(snap);
+    } catch (e) {
+      context += '\n\n【目前頁面資料】(讀取失敗: ' + e.message + ')';
+    }
+    const ctxMsg = { role: 'system', content: context };
+    return [ctxMsg].concat((s && s.history) ? s.history : []);
+  }
 
   function buildAnalysisPrompt(snapshot) {
     // Keep prompt compact; include key columns only.
