@@ -1,21 +1,28 @@
 using System;
 using System.Collections.Generic;
 using System.Configuration;
+using System.Data;
+using System.Data.SqlClient;
 using System.IO;
 using System.Net;
 using System.Text;
 using System.Web;
+using System.Web.Services;
+using System.Web.Script.Services;
 using System.Web.Script.Serialization;
 
-// Standalone AI chat proxy.
+// Consolidated code-behind for ASMDaily.aspx.
 //
-// Reads LLM endpoint + api-key from web.config <appSettings> so the key
-// never leaves the server.  The client posts { messages: [...] } to
-// ?op=chat and gets back the LLM's verbatim response.  Drop this folder
-// into any IIS site, fill in the AppSettings, and you have a working
-// AI assistant page at AiChat.aspx.
-public partial class AiChat : System.Web.UI.Page
+// Two server-side endpoints live on this single page:
+//   1) GetWaferCounts  - ASP.NET page method (called as ASMDaily.aspx/GetWaferCounts).
+//                        Reads W/C from SQL Server using the GPTDB_EAS connection string.
+//   2) ?op=chat        - AI gateway proxy (merged from the old AiChat.aspx.cs).
+//                        Keeps the api-key on the server; the browser never sees it.
+public partial class ASMDaily : System.Web.UI.Page
 {
+    // ======================= AI chat proxy =======================
+    // Handles ASMDaily.aspx?op=chat. Any request without ?op falls through
+    // to the normal page lifecycle and renders the dashboard UI.
     protected void Page_Load(object sender, EventArgs e)
     {
         string op = Request.QueryString["op"];
@@ -140,5 +147,47 @@ public partial class AiChat : System.Web.UI.Page
     {
         if (s == null) return "";
         return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "");
+    }
+
+    // ======================= W/C page method =======================
+    // Server: UMCESIDB02   Table: [GPTDB_EAS].[dbo].[XSITEUSAGEMETER]
+    // Connection string lives in web.config <connectionStrings name="GPTDB_EAS">.
+    [WebMethod]
+    [ScriptMethod(ResponseFormat = ResponseFormat.Json)]
+    public static Dictionary<string, object> GetWaferCounts()
+    {
+        var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+        var connStrSettings = System.Configuration.ConfigurationManager.ConnectionStrings["GPTDB_EAS"];
+
+        if (connStrSettings == null || string.IsNullOrWhiteSpace(connStrSettings.ConnectionString))
+            throw new Exception("Missing connection string: GPTDB_EAS");
+
+        var connStr = connStrSettings.ConnectionString;
+
+        var sql = @"
+      SELECT EQPID, DATA_VAL
+      FROM [dbo].[XSITEUSAGEMETER]
+      WHERE METERTYPE = 'CH_WAFER_COUNT'
+    ";
+
+        using (var conn = new SqlConnection(connStr))
+        using (var cmd = new SqlCommand(sql, conn))
+        {
+            conn.Open();
+            using (var rdr = cmd.ExecuteReader())
+            {
+                while (rdr.Read())
+                {
+                    var eqpid = (rdr["EQPID"] == DBNull.Value) ? "" : rdr["EQPID"].ToString().Trim();
+                    if (string.IsNullOrEmpty(eqpid)) continue;
+
+                    object val = (rdr["DATA_VAL"] == DBNull.Value) ? null : rdr["DATA_VAL"];
+                    result[eqpid] = val;
+                }
+            }
+        }
+
+        return result;
     }
 }
