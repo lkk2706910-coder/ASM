@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copy this file to `appsettings.local.config` on the deployed server and
+  fill in the real values.  `appsettings.local.config` is gitignored and
+  MUST NOT be committed.
+-->
+<appSettings>
+  <add key="AiGatewayUrl" value="<your-ai-gateway-url>" />
+  <add key="AiApiKey" value="<your-api-key-here>" />
+  <add key="AiUserId" value="<your-user-id>" />
+  <add key="AiSystemPrompt" value="You are a helpful assistant." />
+</appSettings>
